@@ -5,8 +5,8 @@ library(bslib)
 library(openxlsx)
 
 demo_workbook_cnn <- "Ch05PrembinaryCNNverticle.xlsm"
-demo_workbook_ann <- "Ch032dimensionANNverticle.xlsm"
-demo_ann_csv_path <- "C:/Users/user/Downloads/Ch032dimensionANNverticle_data2_demo.csv"
+demo_workbook_ann <- "Ch032dimensionANNverticleCNN.xlsm"
+demo_ann_csv_path <- "Ch032dimensionANNverticle_data2_demo.csv"
 
 read_sheet_matrix <- function(path, sheet) {
   sheet_dims <- list(
@@ -35,6 +35,16 @@ read_sheet_matrix <- function(path, sheet) {
 
   as.data.frame(data, stringsAsFactors = FALSE, check.names = FALSE)
 }
+
+format_p_value_text <- function(p) {
+  if (length(p) == 0) return(character())
+  vapply(p, function(value) {
+    if (!is.finite(value) || is.na(value)) return(NA_character_)
+    if (value < 0.001) return("<.001")
+    sprintf("%.3f", value)
+  }, character(1))
+}
+
 
 cell_value <- function(df, row, col) {
   df[[col]][row]
@@ -185,6 +195,27 @@ build_pattern_gallery <- function(patterns, labels) {
     pattern_text = vapply(patterns, pattern_to_block, character(1)),
     check.names = FALSE,
     stringsAsFactors = FALSE
+  )
+}
+
+extract_cnn2_workbook_roc <- function(cnn2_sheet, score_col = 89L, target_col = 92L, row_start = 2L, row_end = 65L) {
+  trimmed <- trim_matrix(cnn2_sheet)
+  if (nrow(trimmed) < row_end || ncol(trimmed) < max(score_col, target_col)) {
+    return(NULL)
+  }
+
+  score <- suppressWarnings(as.numeric(trimmed[row_start:row_end, score_col, drop = TRUE]))
+  target <- suppressWarnings(as.numeric(trimmed[row_start:row_end, target_col, drop = TRUE]))
+  keep <- is.finite(score) & is.finite(target) & target %in% c(0, 1)
+
+  if (!any(keep)) {
+    return(NULL)
+  }
+
+  list(
+    score = as.numeric(score[keep]),
+    target = as.numeric(target[keep]),
+    source = "Workbook CNN2 Prob.p column 1"
   )
 }
 
@@ -525,12 +556,25 @@ predict_model <- function(model_object, features) {
 }
 
 compute_auc <- function(actual, score) {
+  actual <- as.numeric(actual)
+  score <- as.numeric(score)
+  keep <- is.finite(actual) & is.finite(score)
+  actual <- actual[keep]
+  score <- score[keep]
+  if (!length(actual) || length(unique(actual)) < 2) {
+    return(NA_real_)
+  }
+  if (requireNamespace('pROC', quietly = TRUE)) {
+    roc_obj <- tryCatch(pROC::roc(actual, score, quiet = TRUE, direction = '<'), error = function(e) NULL)
+    if (!is.null(roc_obj)) {
+      return(as.numeric(pROC::auc(roc_obj)))
+    }
+  }
   pos <- score[actual == 1]
   neg <- score[actual == 0]
   if (!length(pos) || !length(neg)) {
     return(NA_real_)
   }
-
   wins <- 0
   ties <- 0
   for (p in pos) {
@@ -542,7 +586,6 @@ compute_auc <- function(actual, score) {
       }
     }
   }
-
   (wins + 0.5 * ties) / (length(pos) * length(neg))
 }
 
@@ -568,51 +611,53 @@ build_basic_confusion_matrix <- function(actual, predicted) {
   )
 }
 
-build_validation_results <- function(features, target, algorithm = "logistic_regression", seed = 20260720L, test_fraction = 0.25) {
+build_validation_results <- function(features, target, algorithm = "logistic_regression", seed = 20260720L, test_fraction = 0.25, fixed_model = NULL, model_label = NULL) {
   set.seed(seed)
   n <- nrow(features)
   test_size <- max(2, floor(n * test_fraction))
   test_index <- sort(sample(seq_len(n), size = test_size))
   train_index <- setdiff(seq_len(n), test_index)
-
   train_features <- features[train_index, , drop = FALSE]
   test_features <- features[test_index, , drop = FALSE]
   train_target <- target[train_index]
   test_target <- target[test_index]
-
-  model <- fit_prediction_model(train_features, train_target, algorithm = algorithm)
-  train_pred <- predict_model(model, train_features)
-  test_pred <- predict_model(model, test_features)
-
+  score_prob <- function(pred) {
+    if (!is.null(pred$roc_prob)) as.numeric(pred$roc_prob) else as.numeric(pred$prob)
+  }
+  full_model <- if (is.null(fixed_model)) fit_prediction_model(features, target, algorithm = algorithm) else fixed_model
+  split_model <- if (is.null(fixed_model)) fit_prediction_model(train_features, train_target, algorithm = algorithm) else fixed_model
+  full_pred <- predict_model(full_model, features)
+  train_pred <- predict_model(split_model, train_features)
+  test_pred <- predict_model(split_model, test_features)
   fold_id <- rep(1:5, length.out = n)
   fold_id <- sample(fold_id, n)
   cv_rows <- vector("list", 5)
-
   for (fold in 1:5) {
     fold_test <- which(fold_id == fold)
     fold_train <- setdiff(seq_len(n), fold_test)
-    fold_model <- fit_prediction_model(features[fold_train, , drop = FALSE], target[fold_train], algorithm = algorithm)
+    fold_model <- if (is.null(fixed_model)) fit_prediction_model(features[fold_train, , drop = FALSE], target[fold_train], algorithm = algorithm) else fixed_model
     fold_pred <- predict_model(fold_model, features[fold_test, , drop = FALSE])
     cv_rows[[fold]] <- data.frame(
       fold = fold,
       n_train = length(fold_train),
       n_test = length(fold_test),
-      auc = round(compute_auc(target[fold_test], fold_pred$prob), 6),
+      auc = round(compute_auc(target[fold_test], score_prob(fold_pred)), 6),
       accuracy = round(mean(fold_pred$class == target[fold_test]), 6),
       check.names = FALSE
     )
   }
-
   cv_table <- do.call(rbind, cv_rows)
   cv_auc <- mean(cv_table$auc, na.rm = TRUE)
   cv_accuracy <- mean(cv_table$accuracy, na.rm = TRUE)
-
   summary_table <- data.frame(
-    metric = c("Training AUC", "Test AUC", "5-fold CV AUC", "Training accuracy", "Test accuracy", "5-fold CV accuracy", "Train size", "Test size"),
+    metric = c("Model evaluation path", "Full-data AUC", "Training-split AUC", "Test-split AUC", "5-fold CV mean AUC", "Full-data accuracy", "Training-split accuracy", "Test-split accuracy", "5-fold CV mean accuracy", "Train size", "Test size"),
     value = c(
-      round(compute_auc(train_target, train_pred$prob), 6),
-      round(compute_auc(test_target, test_pred$prob), 6),
+      if (is.null(model_label)) algorithm_label(algorithm) else model_label,
+      round(compute_auc(target, score_prob(full_pred)), 6),
+      round(compute_auc(train_target, score_prob(train_pred)), 6),
+      round(compute_auc(test_target, score_prob(test_pred)), 6),
       round(cv_auc, 6),
+      round(mean(full_pred$class == target), 6),
       round(mean(train_pred$class == train_target), 6),
       round(mean(test_pred$class == test_target), 6),
       round(cv_accuracy, 6),
@@ -621,26 +666,25 @@ build_validation_results <- function(features, target, algorithm = "logistic_reg
     ),
     check.names = FALSE
   )
-
+  test_prob <- score_prob(test_pred)
   test_predictions <- data.frame(
     sample_id = test_index,
     actual = ifelse(test_target == 1, "Positive", "Negative"),
     actual_class = test_target,
     score = round(test_pred$score, 6),
-    prob_positive = round(test_pred$prob, 6),
+    prob_positive = round(test_prob, 6),
     predicted = ifelse(test_pred$class == 1, "Positive", "Negative"),
     predicted_class = test_pred$class,
     correct = ifelse(test_pred$class == test_target, "Correct", "Incorrect"),
     check.names = FALSE
   )
-
   list(
     algorithm = algorithm,
     split_summary = summary_table,
     cv_table = cv_table,
     confusion_matrix = build_basic_confusion_matrix(test_target, test_pred$class),
     test_predictions = test_predictions,
-    model = model,
+    model = split_model,
     train_columns = names(train_features)
   )
 }
@@ -689,7 +733,7 @@ build_forest_data <- function(features, target) {
         CI_high = round(ci_high, 6),
         estimate_label = sprintf("%.2f (%.2f, %.2f)", smd, ci_low, ci_high),
         z_value = round(z_value, 2),
-        p_value = ifelse(is.na(p_value), NA_character_, ifelse(p_value < 0.001, "<0.001", sprintf("%.3f", p_value))),
+        p_value = format_p_value_text(p_value),
         significant = significant,
         abs_SMD = round(abs(smd), 6),
         check.names = FALSE
@@ -758,7 +802,7 @@ extract_glm_feature_rows <- function(model, step_label, group_label = NA_charact
   out$crosses_zero <- ifelse(is.na(out$ci_low) | is.na(out$ci_high), NA, out$ci_low <= 0 & out$ci_high >= 0)
   out$significant <- ifelse(!is.na(out$p_value) & out$p_value < 0.05, "Yes", "No")
   out$estimate_label <- sprintf("%.3f (%.3f, %.3f)", out$estimate, out$ci_low, out$ci_high)
-  out$p_value <- signif(out$p_value, 4)
+  out$p_value <- format_p_value_text(out$p_value)
   out
 }
 
@@ -1165,14 +1209,14 @@ build_comparison_results <- function(features, target, comparison_methods = unna
       fit_result <- fit_method(method_key, feature_names)
       if (inherits(fit_result, "error")) {
         return(rbind(
-          data.frame(algorithm = method_label, variable_set = set_name, split = "Training", n = length(train_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Unavailable:", fit_result$message), check.names = FALSE),
-          data.frame(algorithm = method_label, variable_set = set_name, split = "Testing", n = length(test_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Unavailable:", fit_result$message), check.names = FALSE)
+          data.frame(algorithm = method_label, split = "Training", n = length(train_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Unavailable:", fit_result$message), variable_set = set_name, .before = "Training", check.names = FALSE),
+          data.frame(algorithm = method_label, split = "Testing", n = length(test_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Unavailable:", fit_result$message), variable_set = set_name, .before = "Testing", check.names = FALSE)
         ))
       }
       if (inherits(fit_result, "prediction_error")) {
         return(rbind(
-          data.frame(algorithm = method_label, variable_set = set_name, split = "Training", n = length(train_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Prediction failed:", fit_result$message), check.names = FALSE),
-          data.frame(algorithm = method_label, variable_set = set_name, split = "Testing", n = length(test_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Prediction failed:", fit_result$message), check.names = FALSE)
+          data.frame(algorithm = method_label, split = "Training", n = length(train_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Prediction failed:", fit_result$message), variable_set = set_name, .before = "Training", check.names = FALSE),
+          data.frame(algorithm = method_label, split = "Testing", n = length(test_target), sensitivity = NA_real_, specificity = NA_real_, precision = NA_real_, f1_score = NA_real_, accuracy = NA_real_, auc = NA_real_, ci = NA_character_, ci_low = NA_real_, ci_high = NA_real_, status = paste("Prediction failed:", fit_result$message), variable_set = set_name, .before = "Testing", check.names = FALSE)
         ))
       }
       rbind(
@@ -1301,6 +1345,41 @@ read_ann_demo_csv_sheet <- function(path = demo_ann_csv_path) {
     as.data.frame(stringsAsFactors = FALSE, check.names = FALSE)
 }
 
+extract_ann_workbook_export <- function(trainning_sheet, features = NULL, target = NULL) {
+  trimmed <- trim_matrix(trainning_sheet)
+  if (nrow(trimmed) < 65 || ncol(trimmed) < 35) {
+    return(NULL)
+  }
+
+  true_class <- suppressWarnings(as.numeric(trimmed[2:65, 32, drop = TRUE]))
+  prob_positive <- suppressWarnings(as.numeric(trimmed[2:65, 33, drop = TRUE]))
+  prob_negative <- suppressWarnings(as.numeric(trimmed[2:65, 34, drop = TRUE]))
+  predicted_class <- suppressWarnings(as.numeric(trimmed[2:65, 35, drop = TRUE]))
+  keep <- is.finite(true_class) & is.finite(prob_positive) & true_class %in% c(0, 1)
+
+  if (!any(keep)) {
+    return(NULL)
+  }
+
+  out <- list(
+    true_class = as.numeric(true_class[keep]),
+    prob_positive = as.numeric(prob_positive[keep]),
+    prob_negative = as.numeric(prob_negative[keep]),
+    predicted_class = as.numeric(predicted_class[keep]),
+    roc_source = "Workbook trainning export block (AG positive probability)"
+  )
+
+  if (!is.null(features) && nrow(features) >= sum(keep)) {
+    feature_rows <- features[seq_len(sum(keep)), , drop = FALSE]
+    out$feature_key <- apply(feature_rows, 1, function(row) paste(as.numeric(row), collapse = ","))
+  }
+  if (!is.null(target) && length(target) >= sum(keep)) {
+    out$target <- as.numeric(target[seq_len(sum(keep))])
+  }
+
+  out
+}
+
 build_ann_workbook_model <- function(trainning_sheet, feature_names) {
   trimmed <- trim_matrix(trainning_sheet)
   if (!nrow(trimmed) || ncol(trimmed) < 2) {
@@ -1368,12 +1447,14 @@ predict_ann_workbook_model <- function(model_object, features) {
   hidden_prob <- sigmoid(hidden_linear)
   output_linear <- hidden_prob %*% model_object$hidden_output_weights + matrix(model_object$output_bias, nrow(aligned), 2, byrow = TRUE)
   output_prob <- sigmoid(output_linear)
-  prob_one <- output_prob[, 1]
-  prob_zero <- output_prob[, 2]
-  denom <- prob_one + prob_zero
-  denom[!is.finite(denom) | denom == 0] <- 1
-  prob_positive <- prob_one / denom
-  make_probability_prediction(prob = prob_positive)
+  prob_one <- as.numeric(output_prob[, 1])
+  prob_zero <- as.numeric(output_prob[, 2])
+  pred_class <- ifelse(prob_one >= prob_zero, 1, 0)
+  pred <- make_probability_prediction(prob = prob_one, class = pred_class)
+  pred$prob_negative <- prob_zero
+  pred$roc_prob <- prob_one
+  pred$roc_source <- 'Workbook Prob.p column 1 (Shiny reconstruction of VBA export logic)'
+  pred
 }
 
 normalize_data2_sheet <- function(data2_sheet, target_col = 1, feature_start_col = 2) {
@@ -1407,7 +1488,7 @@ load_ann_demo_csv_data <- function(path = demo_ann_csv_path) {
   trim_matrix(read_ann_demo_csv_sheet(path))
 }
 
-build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, algorithm = "ann_workbook", include_advanced_analysis = FALSE, trainning_sheet = NULL) {
+build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, algorithm = "ann_workbook", include_advanced_analysis = FALSE, trainning_sheet = NULL, use_workbook_probability = TRUE) {
   trimmed <- trim_matrix(data2_sheet)
   if (nrow(trimmed) < 3 || ncol(trimmed) < 2) {
     stop("`data2` does not contain enough rows or columns for ANN modeling.")
@@ -1437,7 +1518,8 @@ build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, 
 
   ann_model_source <- "Fallback R neural net"
   model <- NULL
-  if (!is.null(trainning_sheet) && is.data.frame(trainning_sheet) && nrow(trainning_sheet) > 0) {
+  workbook_export <- NULL
+  if (isTRUE(use_workbook_probability) && !is.null(trainning_sheet) && is.data.frame(trainning_sheet) && nrow(trainning_sheet) > 0) {
     workbook_model <- tryCatch(
       build_ann_workbook_model(trainning_sheet, names(features)),
       error = function(e) e
@@ -1446,6 +1528,10 @@ build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, 
       model <- workbook_model
       ann_model_source <- "Workbook trainning sheet"
     }
+    workbook_export <- tryCatch(
+      extract_ann_workbook_export(trainning_sheet, features = features, target = target),
+      error = function(e) NULL
+    )
   }
   if (is.null(model)) {
     fallback_algorithm <- if (identical(algorithm, "ann_workbook")) "neural_net" else algorithm
@@ -1453,29 +1539,68 @@ build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, 
   }
 
   fitted_pred <- predict_model(model, features)
+  roc_prob <- if (!is.null(fitted_pred$roc_prob)) as.numeric(fitted_pred$roc_prob) else as.numeric(fitted_pred$prob)
+  roc_source <- if (!is.null(fitted_pred$roc_source)) fitted_pred$roc_source else 'Model probability output'
+  prob_negative <- if (!is.null(fitted_pred$prob_negative)) as.numeric(fitted_pred$prob_negative) else 1 - as.numeric(fitted_pred$prob)
+
+  if (!is.null(workbook_export) && length(workbook_export$prob_positive) == length(target)) {
+    roc_prob <- workbook_export$prob_positive
+    if (!is.null(workbook_export$prob_negative) && length(workbook_export$prob_negative) == length(target)) {
+      prob_negative <- workbook_export$prob_negative
+    } else {
+      prob_negative <- 1 - roc_prob
+    }
+    if (!is.null(workbook_export$predicted_class) && length(workbook_export$predicted_class) == length(target)) {
+      fitted_pred$class <- workbook_export$predicted_class
+    } else {
+      fitted_pred$class <- ifelse(roc_prob >= 0.5, 1, 0)
+    }
+    fitted_pred$prob <- roc_prob
+    fitted_pred$roc_prob <- roc_prob
+    fitted_pred$prob_negative <- prob_negative
+    fitted_pred$score <- qlogis(pmin(pmax(roc_prob, 1e-8), 1 - 1e-8))
+    roc_source <- workbook_export$roc_source
+  }
+
+  residual_sq <- (target - roc_prob) ^ 2
   prediction_table <- data.frame(
     sample_id = seq_along(target),
     actual = ifelse(target == 1, "Positive", "Negative"),
     actual_class = target,
+    actual_positive = target,
+    actual_negative = 1 - target,
     score = round(fitted_pred$score, 6),
-    prob_positive = round(fitted_pred$prob, 6),
+    prob_positive = round(roc_prob, 6),
+    prob_negative = round(prob_negative, 6),
     predicted = ifelse(fitted_pred$class == 1, "Positive", "Negative"),
     predicted_class = fitted_pred$class,
+    predicted_positive = fitted_pred$class,
+    predicted_negative = 1 - fitted_pred$class,
+    residual_sq = round(residual_sq, 6),
     correct = ifelse(fitted_pred$class == target, "Correct", "Incorrect"),
     check.names = FALSE
   )
 
-  auc_value <- compute_auc(target, fitted_pred$prob)
-  roc_table <- build_roc_auc_table(target, fitted_pred$prob)
+  auc_value <- compute_auc(target, roc_prob)
+  roc_table <- build_roc_auc_table(target, roc_prob)
   metrics <- build_binary_metrics(target, fitted_pred$class, auc_value)
   confusion_table <- build_confusion_summary(target, fitted_pred$class, auc_value)
-  validation_algorithm <- if (identical(model$algorithm, "ann_workbook")) "neural_net" else model$algorithm
-  validation <- build_validation_results(features, target, algorithm = validation_algorithm)
+  validation <- if (identical(model$algorithm, "ann_workbook")) {
+    build_validation_results(
+      features,
+      target,
+      algorithm = "ann_workbook",
+      fixed_model = model,
+      model_label = "Workbook ANN probability path (same scorer as ROC-AUC summary)"
+    )
+  } else {
+    build_validation_results(features, target, algorithm = model$algorithm, model_label = paste0(algorithm_label(model$algorithm), " probability path"))
+  }
   forest <- build_forest_data(features, target)
   advanced_analysis <- if (isTRUE(include_advanced_analysis)) {
     list(
       feature_extraction = build_feature_extraction_results(features, target),
-      importance = build_importance_results(features, target, algorithm = validation_algorithm)
+      importance = build_importance_results(features, target, algorithm = model$algorithm)
     )
   } else {
     empty_advanced_analysis("Feature steps and importance are available only for uploaded data and ANN demo CSV runs.")
@@ -1492,8 +1617,10 @@ build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, 
     target = target,
     prediction_table = prediction_table,
     roc_points = roc_table$points,
+    auc_workbook_table = build_ch10_auc_sheet(target, roc_prob),
     auc_summary = rbind(
       data.frame(metric = "ANN engine", value = ann_model_source, check.names = FALSE),
+      data.frame(metric = "ROC source", value = roc_source, check.names = FALSE),
       roc_table$summary
     ),
     auc_value = auc_value,
@@ -1507,28 +1634,50 @@ build_ann_model <- function(data2_sheet, target_col = 1, feature_start_col = 2, 
   )
 }
 
-build_cnn2_model <- function(dataabc_sheet, cnn2_sheet, algorithm = "logistic_regression", include_advanced_analysis = FALSE) {
+build_cnn2_model <- function(dataabc_sheet, cnn2_sheet, algorithm = "logistic_regression", include_advanced_analysis = FALSE, roc_override = NULL) {
   dimension <- suppressWarnings(as.integer(cell_value(cnn2_sheet, 1, 11)))
   if (is.na(dimension) || dimension < 2) {
     dimension <- 2
   }
 
   trimmed <- trim_matrix(dataabc_sheet)
-  if (nrow(trimmed) < 3 || ncol(trimmed) <= dimension) {
+  if (nrow(trimmed) < 2 || ncol(trimmed) <= dimension) {
     stop("`dataabc` does not contain enough rows or feature columns to build the model.")
   }
 
-  model_rows <- seq.int(2, nrow(trimmed))
+  first_row_labels <- suppressWarnings(as.numeric(trimmed[1, seq_len(dimension), drop = TRUE]))
+  has_header_row <- any(is.na(first_row_labels)) || !all(first_row_labels %in% c(0, 1))
+  model_rows <- if (isTRUE(has_header_row)) seq.int(2, nrow(trimmed)) else seq_len(nrow(trimmed))
   labels <- safe_numeric_matrix(trimmed[model_rows, seq_len(dimension), drop = FALSE])
   features <- safe_numeric_matrix(trimmed[model_rows, (dimension + 1):ncol(trimmed), drop = FALSE])
   features[is.na(features)] <- 0
 
-  target <- ifelse(labels[[1]] == 1, 1, 0)
+  if (dimension >= 2 && all(rowSums(labels[, 1:2, drop = FALSE], na.rm = TRUE) %in% c(1, 0))) {
+    target <- ifelse(labels[[2]] == 1, 1, 0)
+  } else {
+    target <- ifelse(labels[[1]] == 1, 1, 0)
+  }
   model <- fit_prediction_model(features, target, algorithm = algorithm)
   fitted_pred <- predict_model(model, features)
   linear_score <- fitted_pred$score
   prob_positive <- fitted_pred$prob
   predicted_positive <- fitted_pred$class
+  roc_source <- "Model probability output"
+
+  if (!is.null(roc_override)) {
+    override_target <- as.numeric(roc_override$target)
+    override_score <- as.numeric(roc_override$score)
+    if (length(override_target) == length(target) &&
+        length(override_score) == length(target) &&
+        identical(as.integer(override_target), as.integer(target))) {
+      prob_positive <- override_score
+      clipped_prob <- pmin(pmax(prob_positive, 1e-8), 1 - 1e-8)
+      linear_score <- qlogis(clipped_prob)
+      predicted_positive <- ifelse(prob_positive >= 0.5, 1, 0)
+      roc_source <- roc_override$source
+    }
+  }
+
   predicted_label <- ifelse(predicted_positive == 1, "Positive", "Negative")
   actual_label <- ifelse(target == 1, "Positive", "Negative")
   residual_sq <- (target - prob_positive) ^ 2
@@ -1553,6 +1702,12 @@ build_cnn2_model <- function(dataabc_sheet, cnn2_sheet, algorithm = "logistic_re
   metrics <- build_binary_metrics(target, predicted_positive, roc_table$auc)
   confusion_table <- build_confusion_summary(target, predicted_positive, roc_table$auc)
   validation <- build_validation_results(features, target, algorithm = algorithm)
+  if (!is.null(validation$split_summary) && is.data.frame(validation$split_summary)) {
+    summary_idx <- match(c("Model evaluation path", "Full-data AUC", "Full-data accuracy"), validation$split_summary$metric)
+    if (!is.na(summary_idx[1])) validation$split_summary$value[summary_idx[1]] <- roc_source
+    if (!is.na(summary_idx[2])) validation$split_summary$value[summary_idx[2]] <- round(roc_table$auc, 6)
+    if (!is.na(summary_idx[3])) validation$split_summary$value[summary_idx[3]] <- round(mean(predicted_positive == target), 6)
+  }
   forest <- build_forest_data(features, target)
   advanced_analysis <- if (isTRUE(include_advanced_analysis)) {
     list(
@@ -1574,7 +1729,11 @@ build_cnn2_model <- function(dataabc_sheet, cnn2_sheet, algorithm = "logistic_re
     target = target,
     prediction_table = prediction_table,
     roc_points = roc_table$points,
-    auc_summary = roc_table$summary,
+    auc_workbook_table = build_ch10_auc_sheet(target, prob_positive),
+    auc_summary = rbind(
+      data.frame(metric = "ROC source", value = roc_source, check.names = FALSE),
+      roc_table$summary
+    ),
     auc_value = roc_table$auc,
     metrics = metrics,
     confusion_table = confusion_table,
@@ -1634,6 +1793,63 @@ build_roc_auc_table <- function(actual, score) {
   )
 
   list(points = roc_points, summary = auc_summary, auc = auc)
+}
+
+build_ch10_auc_sheet <- function(actual, score, threshold = 0.5) {
+  actual <- as.numeric(actual)
+  score <- as.numeric(score)
+  predicted <- ifelse(score >= threshold, 1, 0)
+  tp <- sum(predicted == 1 & actual == 1)
+  fp <- sum(predicted == 1 & actual == 0)
+  tn <- sum(predicted == 0 & actual == 0)
+  fn <- sum(predicted == 0 & actual == 1)
+  sensitivity <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
+  specificity <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
+  ppv <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
+  npv <- if ((tn + fn) > 0) tn / (tn + fn) else NA_real_
+  auc <- compute_auc(actual, score)
+  ci <- compute_auc_ci(auc, actual)
+  n1 <- sum(actual == 1)
+  n0 <- sum(actual == 0)
+  q1 <- if (is.na(auc)) NA_real_ else auc / (2 - auc)
+  q2 <- if (is.na(auc)) NA_real_ else (2 * auc^2) / (1 + auc)
+  se <- if (is.na(auc) || n1 == 0 || n0 == 0) {
+    NA_real_
+  } else {
+    sqrt((auc * (1 - auc) + (n1 - 1) * (q1 - auc^2) + (n0 - 1) * (q2 - auc^2)) / (n0 * n1))
+  }
+  z_value <- if (!is.na(se) && se > 0) auc / se else NA_real_
+  p_value <- if (!is.na(z_value)) 2 * stats::pnorm(-abs(z_value)) else NA_real_
+  n_rows <- max(length(actual) + 3, 20)
+  out <- data.frame(
+    Y = rep("", n_rows),
+    X2 = rep("", n_rows),
+    X12 = rep("", n_rows),
+    X13 = rep("", n_rows),
+    X14 = rep("", n_rows),
+    X15 = rep("", n_rows),
+    X16 = rep("", n_rows),
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  out[3, c('Y', 'X2')] <- c('Y', 'X2')
+  data_idx <- seq_along(actual) + 3L
+  out[data_idx, 'Y'] <- as.character(actual)
+  out[data_idx, 'X2'] <- formatC(score, format = 'fg', digits = 15)
+  out[14, c('X12', 'X13', 'X14', 'X15', 'X16')] <- c('ROC', 'Sensitivity', 'Specivity', 'PPV', 'NTV')
+  out[15, c('X12', 'X13', 'X14', 'X15', 'X16')] <- c(
+    formatC(auc, format = 'fg', digits = 15),
+    formatC(sensitivity, format = 'fg', digits = 15),
+    formatC(specificity, format = 'fg', digits = 15),
+    formatC(ppv, format = 'fg', digits = 15),
+    formatC(npv, format = 'fg', digits = 15)
+  )
+  out[16, c('X12', 'X13')] <- c(sprintf('cutoff=%s', formatC(threshold, format = 'fg', digits = 6)), 'ROC analysis')
+  out[17, c('X12', 'X13')] <- c('SE=', formatC(se, format = 'fg', digits = 15))
+  out[18, c('X12', 'X13')] <- c('95%CI=', sprintf('CI: %.2f to %.2f', ci[1], ci[2]))
+  out[19, c('X12', 'X13')] <- c('z=', formatC(z_value, format = 'fg', digits = 15))
+  out[20, c('X12', 'X13')] <- c('p=', format_p_value_text(p_value))
+  out
 }
 
 build_binary_metrics <- function(actual, predicted, auc) {
@@ -1767,6 +1983,7 @@ load_demo_data <- function(path, algorithm = "logistic_regression") {
   window_sheet <- read_sheet_matrix(path, "window")
   dataabc_generated <- build_dataabc(data2_generated, cnn2_sheet, window_sheet)
   dataabc_workbook <- trim_matrix(read_sheet_matrix(path, "dataabc"))
+  workbook_roc <- extract_cnn2_workbook_roc(cnn2_sheet)
   patterns <- extract_patterns(data_sheet)
 
   list(
@@ -1778,7 +1995,7 @@ load_demo_data <- function(path, algorithm = "logistic_regression") {
     cnn2_workbook = trim_matrix(cnn2_sheet),
     dataabc_generated = trim_matrix(dataabc_generated),
     dataabc_workbook = dataabc_workbook,
-    cnn2_model = build_cnn2_model(dataabc_generated, cnn2_sheet, algorithm = algorithm),
+    cnn2_model = build_cnn2_model(dataabc_workbook, cnn2_sheet, algorithm = algorithm, roc_override = workbook_roc),
     patterns = patterns$patterns,
     labels = patterns$labels,
     pattern_gallery = build_pattern_gallery(patterns$patterns, patterns$labels),
@@ -1797,21 +2014,17 @@ load_ann_demo_data <- function(path, data_source = c("original", "normalization"
   patterns <- extract_patterns(data_sheet)
 
   if (isTRUE(use_direct_data2)) {
-    ann_input <- if (identical(data_source, "original")) data2_workbook else normalize_data2_sheet(data2_workbook, target_col = 1, feature_start_col = 2)
+    ann_input <- data2_workbook
     ann_model <- build_ann_model(ann_input, target_col = 1, feature_start_col = 2, algorithm = algorithm, include_advanced_analysis = include_advanced_analysis, trainning_sheet = trainning_workbook)
-    data2_message <- if (identical(data_source, "original")) {
-      "ANN uploaded data ran directly from `data2`."
-    } else {
-      "ANN uploaded data ran after z-score normalization of each predictor column."
-    }
+    data2_message <- "ANN uploaded data ran directly from `data2` without normalization."
   } else if (identical(data_source, "original")) {
     ann_input <- trim_matrix(build_data2(data_sheet))
     ann_model <- build_ann_model(ann_input, target_col = 1, feature_start_col = 3, algorithm = algorithm, include_advanced_analysis = include_advanced_analysis, trainning_sheet = trainning_workbook)
     data2_message <- "ANN workbook rebuilt from original `data`."
   } else {
-    ann_input <- data2_workbook
-    ann_model <- build_ann_model(ann_input, target_col = 1, feature_start_col = 2, algorithm = algorithm, include_advanced_analysis = include_advanced_analysis, trainning_sheet = trainning_workbook)
-    data2_message <- "ANN workbook uses normalized `data2` directly."
+    ann_input <- trim_matrix(build_data2(data_sheet))
+    ann_model <- build_ann_model(ann_input, target_col = 1, feature_start_col = 3, algorithm = algorithm, include_advanced_analysis = include_advanced_analysis, trainning_sheet = trainning_workbook)
+    data2_message <- "ANN workbook uses the same 64-case `data2` rebuild without normalization."
   }
 
   list(
@@ -1848,12 +2061,13 @@ load_ann_demo_csv_result <- function(path = demo_ann_csv_path, algorithm = "ann_
     feature_start_col = 2,
     algorithm = algorithm,
     include_advanced_analysis = include_advanced_analysis,
-    trainning_sheet = trainning_workbook
+    trainning_sheet = trainning_workbook,
+    use_workbook_probability = FALSE
   )
 
   list(
     mode = "ANN",
-    data_source = "normalization",
+    data_source = "demo_csv",
     algorithm = algorithm,
     data_sheet = data_sheet,
     data_demo = data_demo,
@@ -1870,6 +2084,48 @@ load_ann_demo_csv_result <- function(path = demo_ann_csv_path, algorithm = "ann_
     pattern_gallery = build_pattern_gallery(patterns$patterns, patterns$labels),
     data2_check = list(match = TRUE, message = "ANN demo CSV is using the appended 15-column sample file directly."),
     dataabc_check = list(match = TRUE, message = "ANN workbook does not use `dataabc`.")
+  )
+}
+
+load_uploaded_csv_result <- function(path, algorithm = "ann_workbook", data_source = c("original", "normalization"), include_advanced_analysis = TRUE) {
+  data_source <- match.arg(data_source)
+  data_sheet <- read_ann_sheet(demo_workbook_ann, "data")
+  data_demo <- extract_demo_data_block(data_sheet)
+  csv_data2 <- trim_matrix(read_ann_demo_csv_sheet(path))
+  if (identical(data_source, "normalization")) {
+    csv_data2 <- normalize_data2_sheet(csv_data2, target_col = 1, feature_start_col = 2)
+  }
+  trainning_workbook <- if ("trainning" %in% openxlsx::getSheetNames(demo_workbook_ann)) trim_matrix(read_ann_sheet(demo_workbook_ann, "trainning")) else data.frame()
+  patterns <- extract_patterns(data_sheet)
+  ann_model <- build_ann_model(
+    csv_data2,
+    target_col = 1,
+    feature_start_col = 2,
+    algorithm = algorithm,
+    include_advanced_analysis = include_advanced_analysis,
+    trainning_sheet = trainning_workbook,
+    use_workbook_probability = FALSE
+  )
+
+  list(
+    mode = "ANN",
+    data_source = data_source,
+    algorithm = algorithm,
+    data_sheet = data_sheet,
+    data_demo = data_demo,
+    data2_generated = csv_data2,
+    data2_workbook = csv_data2,
+    cnn2_workbook = data.frame(),
+    dataabc_generated = data.frame(),
+    dataabc_workbook = data.frame(),
+    trainning_workbook = trainning_workbook,
+    df_workbook = data.frame(),
+    cnn2_model = ann_model,
+    patterns = patterns$patterns,
+    labels = patterns$labels,
+    pattern_gallery = build_pattern_gallery(patterns$patterns, patterns$labels),
+    data2_check = list(match = TRUE, message = sprintf("Uploaded CSV ran directly in %s mode.", data_source)),
+    dataabc_check = list(match = TRUE, message = "CSV upload does not use workbook `dataabc` expansion.")
   )
 }
 
@@ -1902,7 +2158,7 @@ ui <- page_fillable(
       h3("Prediction model comparison"),
       p("Load the bundled Excel demos or upload a workbook to reproduce the VBA-style modeling pipeline."),
       p("Uploaded data are treated as `data2-style` input with one status column. If you choose `CNN`, the app will transform status `0/1` into `[0,1] / [1,0]` before building `dataabc`. For `ANN` and other algorithms, the status column is left unchanged."),
-      fileInput("workbook", "Upload `.xlsm` workbook", accept = c(".xlsm", ".xlsx")),
+      fileInput("workbook", "Upload `.csv` file", accept = c(".csv")),
       div(
         style = paste(
           "border: 3px solid #7f8c8d;",
@@ -1925,7 +2181,7 @@ ui <- page_fillable(
           selected = "ann"
         )
       ),
-      downloadButton("download_ann_demo_csv", "Download ANN data2 demo CSV"),
+
       actionButton("run_demo_csv", "Run selected algorithm on demo CSV"),
       downloadButton("download_demo_sample", "Download sample example for demo run"),
       div(
@@ -1989,9 +2245,10 @@ ui <- page_fillable(
     div(
       class = "model-results-panel",
       navset_card_tab(
+        id = "results_tabs",
         title = "Model results",
         nav_panel("Predictions", DTOutput("cnn2_predictions_table")),
-        nav_panel("ROC-AUC summary", DTOutput("roc_auc_summary_table")),
+        nav_panel("ROC-AUC summary", DTOutput("roc_auc_summary_overview_table")),
         nav_panel(
           "AUC",
           card(
@@ -2007,11 +2264,15 @@ ui <- page_fillable(
             DTOutput("roc_points_table")
           ),
           card(
+            card_header("Workbook-style ROC sheet (Ch10_2 layout)"),
+            DTOutput("auc_workbook_style_table")
+          ),
+          card(
             card_header("ROC curve"),
             plotOutput("roc_plot", height = 320)
           )
         ),
-        nav_panel("ROC points", DTOutput("roc_points_table")),
+        nav_panel("ROC points", DTOutput("roc_points_overview_table")),
         nav_panel("Metrics", DTOutput("cnn2_metrics_table")),
         nav_panel(
           "Feature extraction",
@@ -2096,22 +2357,36 @@ ui <- page_fillable(
           ),
           card(
             card_header("Algorithm comparison plot"),
-            plotOutput("comparison_plot", height = 1320, width = "100%"),
+            plotOutput("comparison_plot", height = 1100, width = "100%"),
             uiOutput("comparison_original_code_box"),
             uiOutput("comparison_top10_code_box")
           )
         ),
         nav_panel(
+          "Wiki",
+          card(
+            card_header("Algorithm wiki"),
+            uiOutput("wiki_content")
+          )
+        ),
+        nav_panel(
+          "README",
+          card(
+            card_header("README"),
+            uiOutput("readme_content")
+          )
+        ),
+        nav_panel(
           "Prediction mode",
           layout_columns(
-            col_widths = c(4, 8),
+            col_widths = c(3, 9),
             card(
               card_header("Input significant variables"),
               uiOutput("prediction_mode_inputs"),
               layout_columns(
                 col_widths = c(6, 6),
-                actionButton("clear_prediction_mode", "Clean value"),
-                actionButton("run_prediction_mode", "Run prediction mode", class = "btn-primary")
+                actionButton("run_prediction_mode", "Run prediction mode", class = "btn-primary"),
+                actionButton("clear_prediction_mode", "Clean value")
               ),
               tags$div(style = "height: 10px;"),
               verbatimTextOutput("prediction_mode_formula"),
@@ -2120,7 +2395,8 @@ ui <- page_fillable(
             ),
             card(
               card_header("Probability category curve (PCC)"),
-              div(style = "display:flex; justify-content:center;", plotOutput("pcc_plot", height = 700, width = "700px"))
+              div(style = "display:flex; justify-content:center;", plotOutput("pcc_plot", height = 820, width = "820px")),
+              verbatimTextOutput("pcc_explanation")
             )
           )
         ),
@@ -2155,7 +2431,8 @@ ui <- page_fillable(
       nav_panel("Workbook trainning reference", DTOutput("trainning_workbook_table")),
       nav_panel("Workbook DF reference", DTOutput("df_workbook_table")),
       nav_panel("Workbook data2 reference", DTOutput("data2_workbook_table")),
-      nav_panel("Workbook dataabc reference", DTOutput("dataabc_workbook_table")),`r`n      nav_panel("README", uiOutput("readme_content"))
+      nav_panel("Workbook dataabc reference", DTOutput("dataabc_workbook_table")),
+      nav_panel("README", uiOutput("readme_content"))
     )
   )
 )
@@ -2178,6 +2455,7 @@ server <- function(input, output, session) {
       cnn2_sheet <- read_sheet_matrix(path, "CNN2")
       window_sheet <- read_sheet_matrix(path, "window")
       dataabc_workbook <- trim_matrix(read_sheet_matrix(path, "dataabc"))
+      workbook_roc <- extract_cnn2_workbook_roc(cnn2_sheet)
 
       incProgress(0.20, detail = if (identical(data_source, "original")) "Running VBA-style `data2` transformation" else "Using workbook normalized `data2`")
       data2_generated <- if (identical(data_source, "original")) {
@@ -2190,7 +2468,7 @@ server <- function(input, output, session) {
       dataabc_generated <- build_dataabc(data2_generated, cnn2_sheet, window_sheet)
 
       incProgress(0.10, detail = "Building CNN2-style classifier and ROC-AUC summary")
-      cnn2_model <- build_cnn2_model(dataabc_generated, cnn2_sheet, algorithm = algorithm, include_advanced_analysis = include_advanced_analysis)
+      cnn2_model <- build_cnn2_model(dataabc_workbook, cnn2_sheet, algorithm = algorithm, include_advanced_analysis = include_advanced_analysis, roc_override = workbook_roc)
 
       incProgress(0.10, detail = "Preparing pattern preview")
       patterns <- extract_patterns(data_sheet)
@@ -2238,23 +2516,13 @@ server <- function(input, output, session) {
       result
     })
   }
-
   build_pipeline_comparison_bundle <- function(results) {
-    labeled_tables <- Filter(Negate(is.null), lapply(results, function(result) {
-      if (is.null(result) || is.null(result$cnn2_model) || is.null(result$cnn2_model$comparison)) {
-        return(NULL)
-      }
+    valid_results <- Filter(function(result) {
+      !is.null(result) && !is.null(result$cnn2_model) && !is.null(result$cnn2_model$comparison) &&
+        is.data.frame(result$cnn2_model$comparison$table) && nrow(result$cnn2_model$comparison$table)
+    }, results)
 
-      comparison_table <- result$cnn2_model$comparison$table
-      if (!is.data.frame(comparison_table) || !nrow(comparison_table)) {
-        return(NULL)
-      }
-
-      comparison_table$pipeline <- if (is.null(result$mode)) "CNN" else result$mode
-      comparison_table
-    }))
-
-    if (!length(labeled_tables)) {
+    if (!length(valid_results)) {
       empty_table <- data.frame(
         algorithm = character(),
         split = character(),
@@ -2269,28 +2537,22 @@ server <- function(input, output, session) {
         ci_low = numeric(),
         ci_high = numeric(),
         status = character(),
-        pipeline = character(),
+        variable_set = character(),
         check.names = FALSE
       )
       return(list(table = empty_table, top5 = empty_table))
     }
 
-    comparison_table <- do.call(rbind, labeled_tables)
-    comparison_table$split <- factor(as.character(comparison_table$split), levels = c("Training", "Testing"))
-    comparison_table$pipeline <- factor(as.character(comparison_table$pipeline), levels = c("CNN", "ANN"))
-    comparison_table <- comparison_table[order(comparison_table$algorithm, comparison_table$pipeline, comparison_table$split), , drop = FALSE]
-    comparison_table$split <- as.character(comparison_table$split)
-    comparison_table$pipeline <- as.character(comparison_table$pipeline)
-    rownames(comparison_table) <- NULL
+    primary_comparison <- valid_results[[1]]$cnn2_model$comparison
+    comparison_table <- primary_comparison$table
+    top5_table <- primary_comparison$top5
 
-    testing_only <- comparison_table[comparison_table$split == "Testing" & comparison_table$status == "OK" & !is.na(comparison_table$auc), , drop = FALSE]
-    if ("variable_set" %in% names(testing_only)) {
-      testing_only$variable_set <- factor(as.character(testing_only$variable_set), levels = c("Original", "Top 10"))
-      testing_only <- testing_only[order(-testing_only$auc, testing_only$pipeline, testing_only$algorithm, testing_only$variable_set), , drop = FALSE]
-      testing_only$variable_set <- as.character(testing_only$variable_set)
+    if (!is.data.frame(comparison_table)) {
+      comparison_table <- data.frame()
     }
-    testing_only <- testing_only[order(-testing_only$auc, testing_only$pipeline, testing_only$algorithm), , drop = FALSE]
-    top5_table <- utils::head(testing_only, 5)
+    if (!is.data.frame(top5_table)) {
+      top5_table <- data.frame()
+    }
 
     list(table = comparison_table, top5 = top5_table)
   }
@@ -2320,6 +2582,10 @@ server <- function(input, output, session) {
     } else {
       sprintf("%s AUC: %s", label, round(result$cnn2_model$auc_value, 6))
     }
+  }
+
+  go_to_validation_tab <- function() {
+    try(shiny::updateTabsetPanel(session, "results_tabs", selected = "Validation"), silent = TRUE)
   }
 
   output$bundled_path <- renderText({
@@ -2392,6 +2658,7 @@ server <- function(input, output, session) {
       summarize_pipeline_load("ANN", ann_result),
       sep = "\n"
     ))
+    go_to_validation_tab()
   })
 
   observeEvent(input$load_demo_ann, {
@@ -2426,6 +2693,7 @@ server <- function(input, output, session) {
       summarize_pipeline_load("ANN", ann_result),
       sep = "\n"
     ))
+    go_to_validation_tab()
   })
 
   observeEvent(input$run_uploaded_model_original, {
@@ -2433,52 +2701,82 @@ server <- function(input, output, session) {
     selected_config <- resolve_model_configuration(input$model_configuration)
     selected_mode <- selected_config$mode
     selected_algorithm <- selected_config$algorithm
-    primary_result <- if (identical(selected_mode, "ANN")) {
-      load_ann_demo_data(
-        input$workbook$datapath,
-        data_source = "original",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = TRUE,
-        use_direct_data2 = TRUE
-      )
+    is_csv_upload <- grepl("\\.csv$", input$workbook$name, ignore.case = TRUE)
+    showNotification("Running uploaded prediction...", id = "upload_run", duration = NULL, type = "message")
+    if (is_csv_upload) {
+      primary_result <- load_uploaded_csv_result(input$workbook$datapath, algorithm = selected_algorithm, data_source = "original", include_advanced_analysis = TRUE)
+      cnn_result <- safe_load_pipeline(function() {
+        if (identical(selected_mode, "CNN")) stop("Uploaded CSV does not include workbook CNN sheets; using direct CSV modeling instead.")
+        primary_result
+      })
+      ann_result <- safe_load_pipeline(function() {
+        load_uploaded_csv_result(input$workbook$datapath, algorithm = selected_algorithm, data_source = "original", include_advanced_analysis = TRUE)
+      })
+      workbook_data(attach_pipeline_comparison_bundle(primary_result, list(cnn_result, ann_result)))
+      load_message(paste(
+        sprintf("Loaded file: %s", input$workbook$name),
+        "Uploaded CSV ran through the direct data pipeline.",
+        sprintf("Primary display pipeline: %s", selected_mode),
+        sprintf("Algorithm: %s", algorithm_label(selected_algorithm)),
+        sprintf("Data source: %s", "original"),
+        summarize_pipeline_load("CNN", cnn_result),
+        summarize_pipeline_load("ANN", ann_result),
+        sep = "\n"
+      ))
+      go_to_validation_tab()
+      removeNotification('upload_run')
+      showNotification('Run completed. Results opened on Validation tab.', type = 'message', duration = 3)
     } else {
-      load_workbook_data(
-        input$workbook$datapath,
-        input$workbook$name,
-        data_source = "original",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = if (identical(selected_mode, "ANN")) FALSE else TRUE
-      )
+      primary_result <- if (identical(selected_mode, "ANN")) {
+        load_ann_demo_data(
+          input$workbook$datapath,
+          data_source = "original",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = TRUE,
+          use_direct_data2 = TRUE
+        )
+      } else {
+        load_workbook_data(
+          input$workbook$datapath,
+          input$workbook$name,
+          data_source = "original",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = if (identical(selected_mode, "ANN")) FALSE else TRUE
+        )
+      }
+      cnn_result <- safe_load_pipeline(function() {
+        load_workbook_data(
+          input$workbook$datapath,
+          input$workbook$name,
+          data_source = "original",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = TRUE
+        )
+      })
+      ann_result <- safe_load_pipeline(function() {
+        load_ann_demo_data(
+          input$workbook$datapath,
+          data_source = "original",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = TRUE,
+          use_direct_data2 = TRUE
+        )
+      })
+      workbook_data(attach_pipeline_comparison_bundle(primary_result, list(cnn_result, ann_result)))
+      load_message(paste(
+        sprintf("Loaded workbook: %s", input$workbook$name),
+        "Side-by-side comparison attempted for CNN and ANN using the uploaded workbook.",
+        sprintf("Primary display pipeline: %s", selected_mode),
+        sprintf("Algorithm: %s", algorithm_label(selected_algorithm)),
+        sprintf("Data source: %s", "original"),
+        summarize_pipeline_load("CNN", cnn_result),
+        summarize_pipeline_load("ANN", ann_result),
+        sep = "\n"
+      ))
+      go_to_validation_tab()
+      removeNotification('upload_run')
+      showNotification('Run completed. Results opened on Validation tab.', type = 'message', duration = 3)
     }
-    cnn_result <- safe_load_pipeline(function() {
-      load_workbook_data(
-        input$workbook$datapath,
-        input$workbook$name,
-        data_source = "original",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = TRUE
-      )
-    })
-    ann_result <- safe_load_pipeline(function() {
-      load_ann_demo_data(
-        input$workbook$datapath,
-        data_source = "original",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = TRUE,
-        use_direct_data2 = TRUE
-      )
-    })
-    workbook_data(attach_pipeline_comparison_bundle(primary_result, list(cnn_result, ann_result)))
-    load_message(paste(
-      sprintf("Loaded workbook: %s", input$workbook$name),
-      "Side-by-side comparison attempted for CNN and ANN using the uploaded workbook.",
-      sprintf("Primary display pipeline: %s", selected_mode),
-      sprintf("Algorithm: %s", algorithm_label(selected_algorithm)),
-      sprintf("Data source: %s", "original"),
-      summarize_pipeline_load("CNN", cnn_result),
-      summarize_pipeline_load("ANN", ann_result),
-      sep = "\n"
-    ))
   })
 
   observeEvent(input$run_uploaded_model_normalized, {
@@ -2486,52 +2784,79 @@ server <- function(input, output, session) {
     selected_config <- resolve_model_configuration(input$model_configuration)
     selected_mode <- selected_config$mode
     selected_algorithm <- selected_config$algorithm
-    primary_result <- if (identical(selected_mode, "ANN")) {
-      load_ann_demo_data(
-        input$workbook$datapath,
-        data_source = "normalization",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = TRUE,
-        use_direct_data2 = TRUE
-      )
+    is_csv_upload <- grepl("\\.csv$", input$workbook$name, ignore.case = TRUE)
+    showNotification("Running uploaded prediction...", id = "upload_run", duration = NULL, type = "message")
+    if (is_csv_upload) {
+      primary_result <- load_uploaded_csv_result(input$workbook$datapath, algorithm = selected_algorithm, data_source = "normalization", include_advanced_analysis = TRUE)
+      cnn_result <- safe_load_pipeline(function() {
+        if (identical(selected_mode, "CNN")) stop("Uploaded CSV does not include workbook CNN sheets; using direct CSV modeling instead.")
+        primary_result
+      })
+      ann_result <- safe_load_pipeline(function() {
+        load_uploaded_csv_result(input$workbook$datapath, algorithm = selected_algorithm, data_source = "normalization", include_advanced_analysis = TRUE)
+      })
+      workbook_data(attach_pipeline_comparison_bundle(primary_result, list(cnn_result, ann_result)))
+      load_message(paste(
+        sprintf("Loaded file: %s", input$workbook$name),
+        "Uploaded CSV ran through the direct normalized-data pipeline.",
+        sprintf("Primary display pipeline: %s", selected_mode),
+        sprintf("Algorithm: %s", algorithm_label(selected_algorithm)),
+        sprintf("Data source: %s", "normalization"),
+        summarize_pipeline_load("CNN", cnn_result),
+        summarize_pipeline_load("ANN", ann_result),
+        sep = "\n"
+      ))
+      go_to_validation_tab()
+      removeNotification('upload_run')
+      showNotification('Run completed. Results opened on Validation tab.', type = 'message', duration = 3)
     } else {
-      load_workbook_data(
-        input$workbook$datapath,
-        input$workbook$name,
-        data_source = "normalization",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = if (identical(selected_mode, "ANN")) FALSE else TRUE
-      )
+      primary_result <- if (identical(selected_mode, "ANN")) {
+        load_ann_demo_data(
+          input$workbook$datapath,
+          data_source = "normalization",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = TRUE,
+          use_direct_data2 = TRUE
+        )
+      } else {
+        load_workbook_data(
+          input$workbook$datapath,
+          input$workbook$name,
+          data_source = "normalization",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = if (identical(selected_mode, "ANN")) FALSE else TRUE
+        )
+      }
+      cnn_result <- safe_load_pipeline(function() {
+        load_workbook_data(
+          input$workbook$datapath,
+          input$workbook$name,
+          data_source = "normalization",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = TRUE
+        )
+      })
+      ann_result <- safe_load_pipeline(function() {
+        load_ann_demo_data(
+          input$workbook$datapath,
+          data_source = "normalization",
+          algorithm = selected_algorithm,
+          include_advanced_analysis = TRUE,
+          use_direct_data2 = TRUE
+        )
+      })
+      workbook_data(attach_pipeline_comparison_bundle(primary_result, list(cnn_result, ann_result)))
+      load_message(paste(
+        sprintf("Loaded workbook: %s", input$workbook$name),
+        "Side-by-side comparison attempted for CNN and ANN using the uploaded workbook.",
+        sprintf("Primary display pipeline: %s", selected_mode),
+        sprintf("Algorithm: %s", algorithm_label(selected_algorithm)),
+        sprintf("Data source: %s", "normalization"),
+        summarize_pipeline_load("CNN", cnn_result),
+        summarize_pipeline_load("ANN", ann_result),
+        sep = "\n"
+      ))
     }
-    cnn_result <- safe_load_pipeline(function() {
-      load_workbook_data(
-        input$workbook$datapath,
-        input$workbook$name,
-        data_source = "normalization",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = TRUE
-      )
-    })
-    ann_result <- safe_load_pipeline(function() {
-      load_ann_demo_data(
-        input$workbook$datapath,
-        data_source = "normalization",
-        algorithm = selected_algorithm,
-        include_advanced_analysis = TRUE,
-        use_direct_data2 = TRUE
-      )
-    })
-    workbook_data(attach_pipeline_comparison_bundle(primary_result, list(cnn_result, ann_result)))
-    load_message(paste(
-      sprintf("Loaded workbook: %s", input$workbook$name),
-      "Side-by-side comparison attempted for CNN and ANN using the uploaded workbook.",
-      sprintf("Primary display pipeline: %s", selected_mode),
-      sprintf("Algorithm: %s", algorithm_label(selected_algorithm)),
-      sprintf("Data source: %s", "normalization"),
-      summarize_pipeline_load("CNN", cnn_result),
-      summarize_pipeline_load("ANN", ann_result),
-      sep = "\n"
-    ))
   })
 
   observeEvent(input$run_demo_csv, {
@@ -2542,7 +2867,7 @@ server <- function(input, output, session) {
       load_workbook_data(
         demo_workbook_cnn,
         demo_workbook_cnn,
-        data_source = "normalization",
+        data_source = "original",
         algorithm = selected_algorithm,
         include_advanced_analysis = TRUE
       )
@@ -2567,6 +2892,7 @@ server <- function(input, output, session) {
       summarize_pipeline_load("ANN", ann_result),
       sep = "\n"
     ))
+    go_to_validation_tab()
   })
 
   output$pattern_picker <- renderUI({
@@ -2866,7 +3192,7 @@ server <- function(input, output, session) {
   })
 
   output$forest_plot <- render_safe_plot({
-    req(session$clientData$output_forest_plot_width > 420, session$clientData$output_forest_plot_height > 420)
+    req(workbook_data())
     req(workbook_data())
     forest_table <- filtered_forest_table()
     req(nrow(forest_table) > 0)
@@ -2919,7 +3245,7 @@ server <- function(input, output, session) {
   })
 
   output$feature_extraction_forest_plot <- render_safe_plot({
-    req(session$clientData$output_feature_extraction_forest_plot_width > 320, session$clientData$output_feature_extraction_forest_plot_height > 320)
+    req(workbook_data())
     req(workbook_data())
     forest_table <- workbook_data()$cnn2_model$feature_extraction$final_forest
     req(is.data.frame(forest_table), nrow(forest_table) > 0, "feature" %in% names(forest_table))
@@ -3008,29 +3334,30 @@ server <- function(input, output, session) {
     stripchart(score ~ axis_group, data = plot_frame, vertical = TRUE, method = "jitter", pch = 16, cex = 0.5, col = "#34495e", add = TRUE)
     grid(nx = NA, ny = NULL, col = "#ecf0f1")
   })
-
   comparison_table_with_mode <- reactive({
     req(workbook_data())
-    comparison_table <- workbook_data()$comparison_bundle$table
-    if (is.null(comparison_table)) {
-      comparison_table <- workbook_data()$cnn2_model$comparison$table
+    comparison_bundle <- workbook_data()$comparison_bundle
+    if (is.list(comparison_bundle) && is.data.frame(comparison_bundle$table) && nrow(comparison_bundle$table)) {
+      return(comparison_bundle$table)
     }
+    comparison_table <- workbook_data()$cnn2_model$comparison$table
     req(is.data.frame(comparison_table))
     comparison_table
   })
 
   comparison_top5_with_mode <- reactive({
     req(workbook_data())
-    top5_table <- workbook_data()$comparison_bundle$top5
-    if (is.null(top5_table)) {
-      top5_table <- workbook_data()$cnn2_model$comparison$top5
+    comparison_bundle <- workbook_data()$comparison_bundle
+    if (is.list(comparison_bundle) && is.data.frame(comparison_bundle$top5)) {
+      return(comparison_bundle$top5)
     }
+    top5_table <- workbook_data()$cnn2_model$comparison$top5
     req(is.data.frame(top5_table))
     top5_table
   })
 
   output$importance_forest_plot <- render_safe_plot({
-    req(session$clientData$output_importance_forest_plot_width > 420, session$clientData$output_importance_forest_plot_height > 420)
+    req(workbook_data())
     req(workbook_data())
     forest_table <- workbook_data()$cnn2_model$importance$forest
     req(is.data.frame(forest_table), nrow(forest_table) > 0, "feature" %in% names(forest_table))
@@ -3251,7 +3578,9 @@ server <- function(input, output, session) {
   })
 
   output$comparison_plot <- render_safe_plot({
-    if (is.null(session$clientData$output_comparison_plot_width) || is.null(session$clientData$output_comparison_plot_height) || session$clientData$output_comparison_plot_width < 520 || session$clientData$output_comparison_plot_height < 520) {
+    plot_width <- session$clientData$output_comparison_plot_width
+    plot_height <- session$clientData$output_comparison_plot_height
+    if (!is.null(plot_width) && !is.null(plot_height) && (plot_width < 320 || plot_height < 320)) {
       old_par <- par(no.readonly = TRUE)
       on.exit(par(old_par), add = TRUE)
       par(mar = c(0, 0, 0, 0))
@@ -3262,67 +3591,57 @@ server <- function(input, output, session) {
     comparison_table <- comparison_table_with_mode()
     comparison_table <- comparison_table[comparison_table$split == "Testing" & comparison_table$status == "OK" & !is.na(comparison_table$auc), , drop = FALSE]
     req(nrow(comparison_table) > 0)
-    plot_data <- comparison_table[order(comparison_table$algorithm, comparison_table$pipeline, comparison_table$variable_set), , drop = FALSE]
+    plot_data <- comparison_table[order(comparison_table$variable_set, comparison_table$auc, comparison_table$algorithm), , drop = FALSE]
+    plot_data <- plot_data[nrow(plot_data):1, , drop = FALSE]
+    plot_data$label <- ifelse(
+      is.na(plot_data$variable_set) | plot_data$variable_set == "",
+      as.character(plot_data$algorithm),
+      paste0(plot_data$algorithm, " (", plot_data$variable_set, ")")
+    )
     shared_min <- min(plot_data$ci_low, na.rm = TRUE)
     shared_max <- max(plot_data$ci_high, na.rm = TRUE)
     pad <- max(0.02, 0.08 * (shared_max - shared_min))
-
-    draw_panel <- function(set_name, title_text, point_col) {
-      set_data <- plot_data[plot_data$variable_set == set_name, , drop = FALSE]
-      if (!nrow(set_data)) {
-        par(mar = c(3.8, 1.2, 3.0, 0.2))
-        plot.new()
-        text(0.5, 0.5, sprintf("No testing rows available for %s.", set_name), cex = 1)
-        par(mar = c(3.8, 4.2, 3.0, 1.6))
-        plot.new()
-        text(0.5, 0.5, "Forest plot unavailable.", cex = 1)
-        return(invisible())
-      }
-      set_data <- set_data[order(set_data$auc, set_data$algorithm, set_data$pipeline), , drop = FALSE]
-      set_data <- set_data[nrow(set_data):1, , drop = FALSE]
-      y_pos <- seq_len(nrow(set_data))
-
-      par(mar = c(3.8, 1.2, 3.0, 0.2))
-      plot.new()
-      plot.window(xlim = c(0, 1.02), ylim = c(0.5, nrow(set_data) + 1.1))
-      title(main = title_text, line = 1.2, font.main = 2, cex.main = 1.15)
-      text(0.02, nrow(set_data) + 0.7, "Algorithm", pos = 4, font = 2, cex = 0.94)
-      text(0.40, nrow(set_data) + 0.7, "Pipeline", pos = 4, font = 2, cex = 0.94)
-      text(0.58, nrow(set_data) + 0.7, "AUC (95% CI)", pos = 4, font = 2, cex = 0.94)
-      text(0.93, nrow(set_data) + 0.7, "n", pos = 4, font = 2, cex = 0.94)
-      for (i in seq_len(nrow(set_data))) {
-        text(0.02, y_pos[i], truncate_plot_label(set_data$algorithm[i], 22), pos = 4, cex = 0.82, font = 2, col = "#2c3e50")
-        text(0.40, y_pos[i], as.character(set_data$pipeline[i]), pos = 4, cex = 0.82, font = 2, col = point_col)
-        text(0.58, y_pos[i], sprintf("%.3f (%s)", set_data$auc[i], set_data$ci[i]), pos = 4, cex = 0.80, font = 2)
-        text(0.93, y_pos[i], as.character(set_data$n[i]), pos = 4, cex = 0.80, font = 2)
-      }
-      abline(h = seq(0.5, nrow(set_data) + 0.5, by = 1), col = "#f1f3f4", lty = 3)
-
-      par(mar = c(3.8, 4.2, 3.0, 1.6))
-      plot(
-        x = set_data$auc,
-        y = y_pos,
-        xlim = c(max(0, shared_min - pad), min(1, shared_max + pad)),
-        ylim = c(0.5, nrow(set_data) + 1.1),
-        yaxt = "n",
-        ylab = "",
-        xlab = "Test ROC-AUC (95% CI)",
-        main = ""
-      )
-      abline(v = 0.5, lty = 2, col = "#7f8c8d", lwd = 1.5)
-      segments(set_data$ci_low, y_pos, set_data$ci_high, y_pos, lwd = 2.2, col = "#34495e")
-      points(set_data$auc, y_pos, pch = 15, cex = 1.45, col = point_col)
-      text(shared_min - pad * 0.08, nrow(set_data) + 0.45, "Lower", col = "#117a65", cex = 0.82)
-      text(shared_max + pad * 0.08, nrow(set_data) + 0.45, "Higher", col = "#c0392b", cex = 0.82)
-      grid(nx = NULL, ny = NULL, col = "#ecf0f1")
-    }
+    y_pos <- seq(from = 0.8, by = 0.7, length.out = nrow(plot_data))
 
     old_par <- par(no.readonly = TRUE)
     on.exit(par(old_par), add = TRUE)
-    layout(matrix(c(1, 2, 3, 4), nrow = 2, byrow = TRUE), widths = c(5.0, 2.8), heights = c(1, 1))
-    draw_panel("Original", "Original Variables", "#117a65")
-    draw_panel("Top 10", "Top 10 Variables", "#c0392b")
+    layout(matrix(c(1, 2), nrow = 1), widths = c(5.8, 2.9))
+
+    par(mar = c(3.8, 1.2, 3.0, 0.2))
+    plot.new()
+    plot.window(xlim = c(0, 1.02), ylim = c(0.45, max(y_pos) + 0.75))
+    title(main = "Algorithm Comparison Plot", line = 1.0, font.main = 2, cex.main = 1.30)
+    text(0.02, max(y_pos) + 0.42, "Algorithm", pos = 4, font = 2, cex = 1.12)
+    text(0.52, max(y_pos) + 0.42, "AUC (95% CI)", pos = 4, font = 2, cex = 1.08)
+    text(0.90, max(y_pos) + 0.42, "n", pos = 4, font = 2, cex = 1.08)
+    for (i in seq_len(nrow(plot_data))) {
+      row_col <- ifelse(as.character(plot_data$variable_set[i]) == "Top 10", "#c0392b", "#117a65")
+      text(0.02, y_pos[i], truncate_plot_label(plot_data$label[i], 34), pos = 4, cex = 0.98, font = 2, col = row_col)
+      text(0.52, y_pos[i], sprintf("%.3f (%s)", plot_data$auc[i], plot_data$ci[i]), pos = 4, cex = 0.92, font = 2)
+      text(0.90, y_pos[i], as.character(plot_data$n[i]), pos = 4, cex = 0.94, font = 2)
+    }
+    abline(h = seq(0.5, nrow(plot_data) + 0.5, by = 1), col = "#f1f3f4", lty = 3)
+
+    par(mar = c(3.8, 4.2, 3.0, 1.6))
+    plot(
+      x = plot_data$auc,
+      y = y_pos,
+      xlim = c(max(0, shared_min - pad), min(1, shared_max + pad)),
+      ylim = c(0.45, max(y_pos) + 0.75),
+      yaxt = "n",
+      ylab = "",
+      xlab = "Test ROC-AUC (95% CI)",
+      main = ""
+    )
+    abline(v = 0.5, lty = 2, col = "#7f8c8d", lwd = 1.5)
+    segments(plot_data$ci_low, y_pos, plot_data$ci_high, y_pos, lwd = 2.2, col = "#34495e")
+    point_cols <- ifelse(as.character(plot_data$variable_set) == "Top 10", "#c0392b", "#117a65")
+    points(plot_data$auc, y_pos, pch = 15, cex = 1.55, col = point_cols)
+    text(shared_min - pad * 0.08, max(y_pos) + 0.45, "Original", col = "#117a65", cex = 0.82)
+    text(shared_max + pad * 0.08, max(y_pos) + 0.45, "Top 10", col = "#c0392b", cex = 0.82)
+    grid(nx = NULL, ny = NULL, col = "#ecf0f1")
   })
+
 
   output$pcc_plot <- render_safe_plot({
     if (!is.null(prediction_mode_error())) {
@@ -3387,18 +3706,20 @@ server <- function(input, output, session) {
   make_dt <- function(data_expr) {
     renderDT({
       req(workbook_data())
+      data <- tryCatch(data_expr(), error = function(e) data.frame(note = conditionMessage(e), check.names = FALSE))
+      if (is.null(data) || !is.data.frame(data) || !ncol(data)) data <- data.frame(note = "No data available for the current result.", check.names = FALSE)
       datatable(
-        data_expr(),
+        data,
         options = list(scrollX = TRUE, pageLength = 10),
         rownames = FALSE
       )
     })
   }
-
   make_full_dt <- function(data_expr) {
     renderDT({
       req(workbook_data())
-      data <- data_expr()
+      data <- tryCatch(data_expr(), error = function(e) data.frame(note = conditionMessage(e), check.names = FALSE))
+      if (is.null(data) || !is.data.frame(data) || !ncol(data)) data <- data.frame(note = "No data available for the current result.", check.names = FALSE)
       datatable(
         data,
         options = list(
@@ -3424,9 +3745,12 @@ server <- function(input, output, session) {
   output$data2_workbook_table <- make_dt(function() workbook_data()$data2_workbook)
   output$dataabc_workbook_table <- make_dt(function() workbook_data()$dataabc_workbook)
   output$cnn2_predictions_table <- make_full_dt(function() workbook_data()$cnn2_model$prediction_table)
+  output$roc_auc_summary_overview_table <- make_full_dt(function() workbook_data()$cnn2_model$auc_summary)
+  output$roc_points_overview_table <- make_full_dt(function() workbook_data()$cnn2_model$roc_points)
   output$roc_auc_summary_table <- make_full_dt(function() workbook_data()$cnn2_model$auc_summary)
   output$auc_confusion_table <- make_full_dt(function() workbook_data()$cnn2_model$confusion_table)
   output$roc_points_table <- make_full_dt(function() workbook_data()$cnn2_model$roc_points)
+  output$auc_workbook_style_table <- make_full_dt(function() workbook_data()$cnn2_model$auc_workbook_table)
   output$cnn2_metrics_table <- make_full_dt(function() workbook_data()$cnn2_model$metrics)
   output$feature_extraction_summary_table <- make_full_dt(function() workbook_data()$cnn2_model$feature_extraction$summary)
   output$feature_step1_table <- make_full_dt(function() workbook_data()$cnn2_model$feature_extraction$step1)
@@ -3458,13 +3782,48 @@ server <- function(input, output, session) {
   output$validation_cv_table <- make_full_dt(function() workbook_data()$cnn2_model$validation$cv_table)
   output$validation_confusion_table <- make_full_dt(function() workbook_data()$cnn2_model$validation$confusion_matrix)
   output$validation_test_predictions_table <- make_full_dt(function() workbook_data()$cnn2_model$validation$test_predictions)
+
+  output$readme_content <- renderUI({
+    includeMarkdown("README.md")
+  })
+
+  output$wiki_content <- renderUI({
+    tags$div(
+      tags$p("This wiki summarizes the algorithms and the main visualizations used in the app."),
+      tags$h4("CNN"),
+      tags$p("Workbook-style expanded feature pipeline using the first status column recoded into two indicator columns before model fitting."),
+      tags$p("Visualizations: ROC curve, forest plot, importance forest, comparison forest, PCC."),
+      tags$h4("ANN"),
+      tags$p("Workbook-style tabular ANN using the trainning sheet when available, with direct status plus feature columns from the data matrix."),
+      tags$p("Visualizations: ROC curve, forest plot, importance forest, comparison forest, PCC."),
+      tags$h4("Standard prediction algorithms"),
+      tags$p("Logistic Regression, Linear Regression Score, KNN, Naive Bayes, LDA, QDA, Decision Tree, Neural Net, Random Forest, and SVM are applied to the prepared predictor matrix for side-by-side ROC-AUC comparison."),
+      tags$p("Visualizations: algorithm comparison tables, Top 5 testing AUC table, side-by-side comparison forests, and QSubgrouptest export code blocks."),
+      tags$h4("Feature extraction and importance"),
+      tags$p("Feature extraction uses logistic-regression-based screening and grouped score analysis. Importance uses backward elimination by test ROC-AUC until the final 10 variables remain."),
+      tags$p("Visualizations: retained-variable forest, importance forest, elimination table, and final-10 table.")
+    )
+  })
+
+  output$pcc_explanation <- renderText({
+    if (is.null(workbook_data()) || is.null(prediction_mode_pred())) {
+      return("")
+    }
+    pred <- prediction_mode_pred()
+    auc_value <- suppressWarnings(as.numeric(workbook_data()$cnn2_model$auc_value))
+    theta_value <- pred$score[1]
+    if (!is.finite(theta_value)) {
+      return("Current theta is not finite, so the PCC marker could not be interpreted.")
+    }
+    if (abs(theta_value) < 0.25) {
+      sprintf("Current theta is %.4f, which is close to 0, so the logistic curves naturally give probabilities near 0.5. With a lower AUC such as %.4f, the model may separate classes only weakly, so the current case can stay near the midpoint instead of approaching 0.9.", theta_value, auc_value)
+    } else {
+      sprintf("Current theta is %.4f. Positive theta shifts P(1) upward and negative theta shifts P(0) upward. Model AUC is %.4f.", theta_value, auc_value)
+    }
+  })
+
 }
-
 shinyApp(ui, server)
-
-
-
-
 
 
 
