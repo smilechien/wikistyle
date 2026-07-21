@@ -1,50 +1,33 @@
-# JMIR Deep Demo App
+﻿# JMIR Deep Demo App
 
-Shiny app for comparing workbook-style CNN and ANN prediction pipelines together with standard prediction algorithms on bundled demo files or uploaded `.xlsm` workbooks.
+A Shiny application for reproducing the workbook-style `CNN` and `ANN` demo pipelines, comparing them with common prediction algorithms, and exploring ROC-AUC, feature forests, importance filtering, validation summaries, and prediction-mode probability curves.
 
-## Files
+## Overview
+
+This app is designed around the project workbooks and demo CSV used in the JMIR deep-learning-style workflow. It supports:
+
+- bundled `CNN` and `ANN` demo runs
+- uploaded CSV prediction data
+- ROC-AUC summaries and workbook-style ROC tables
+- feature extraction and forest plots
+- backward elimination to a final top-10 variable set
+- algorithm comparison tables and comparison forest plots
+- prediction mode with a category probability curve (PCC)
+- QSubgrouptest export text blocks for external forest plotting
+
+## Project Files
 
 - `app.R`: main Shiny application
+- `README.md`: project README shown both on GitHub and in the app README tab
 - `Ch05PrembinaryCNNverticle.xlsm`: bundled CNN demo workbook
-- `Ch032dimensionANNverticle.xlsm`: bundled ANN demo workbook
+- `Ch032dimensionANNverticleCNN.xlsm`: bundled ANN demo workbook
+- `Ch032dimensionANNverticle_data2_demo.csv`: bundled ANN demo CSV used by the demo CSV button and sample upload testing
 
-## What The App Does
+## Algorithm Groups
 
-- Runs the bundled CNN and ANN demos
-- Runs uploaded workbook data in original or normalized mode
-- Compares independent algorithms by ROC-AUC
-- Builds feature forest plots
-- Builds importance-based top-10 variable selection
-- Shows prediction mode with a category probability curve (PCC)
-- Exports forest-style code blocks for QSubgrouptest-style plotting
+### Machine Learning Methods
 
-## Model Modes
-
-### CNN
-
-CNN in this app is the workbook pipeline, not a modern image library CNN.
-
-Steps:
-
-1. Read the source workbook
-2. Recode the first status column into two columns such as `1 0` and `0 1`
-3. Expand the data through the workbook-style `dataabc` process
-4. Run the selected prediction algorithm on the expanded feature matrix
-
-### ANN
-
-ANN in this app is a direct tabular neural-network workflow.
-
-Steps:
-
-1. Keep the first column as the original status column
-2. Use columns `2..n` as predictor variables
-3. Prefer the workbook `trainning` sheet as the ANN engine
-4. Fall back to the R neural-net engine only if workbook ANN weights are not usable
-
-## Supported Algorithm Comparison
-
-The comparison section can include:
+The app compares the following methods as machine-learning or predictive modeling methods:
 
 - `CNN`
 - `ANN`
@@ -59,37 +42,164 @@ The comparison section can include:
 - `Random Forest`
 - `SVM`
 
-Comparison is shown as:
+### Neural-Network-Based Methods
 
-- `Original Variables`
-- `Top 10 Variables`
+These methods are neural-network-based in the current app:
 
-Top 5 ranking is based on test ROC-AUC.
+- `ANN`
+- `Neural Net`
 
-## Running The App
+### Deep Learning
 
-Open R in the project folder and run:
+The current app does **not** implement a modern deep-learning framework such as TensorFlow or PyTorch.
+
+Important interpretation notes:
+
+- `CNN` in this project refers to the workbook-specific pipeline name, not a modern convolutional image network.
+- `ANN` is a workbook-style or surrogate shallow neural-network path, not a deep multi-layer architecture.
+- `Neural Net` uses an R neural-network implementation and should be described as neural-network-based machine learning rather than deep learning.
+
+## Data Expectations
+
+### ANN-Style Data
+
+For ANN-style input in the app:
+
+- row 1 contains variable names
+- column 1 contains the outcome or status
+- columns `2..n` contain predictor variables
+
+### CNN-Style Data
+
+For CNN-style input in the app:
+
+- the first status column is transformed into two indicator columns
+- the transformed data then follow the workbook-style expansion path before model fitting
+
+## CNN vs ANN in This App
+
+### CNN Pipeline
+
+`CNN` here is the workbook transformation pipeline.
+
+Steps:
+
+1. Read the source demo or workbook data.
+2. Recode the status column into paired indicator columns such as `1 0` and `0 1`.
+3. Expand features through the workbook-style `dataabc` process.
+4. Fit the selected prediction algorithm on the expanded feature matrix.
+
+### ANN Pipeline
+
+`ANN` here is the direct tabular prediction path.
+
+Steps:
+
+1. Keep the original status column as column 1.
+2. Use columns `2..n` as predictors.
+3. Run the ANN-style prediction path on the tabular matrix.
+4. For the demo CSV and uploaded sample CSV consistency path, the app uses the same `Neural Net probability path` for validation.
+
+## Main App Sections
+
+### Predictions
+
+Displays the main prediction output table for the currently loaded result.
+
+### ROC-AUC Summary
+
+Shows a compact summary table of ROC-AUC information.
+
+### AUC
+
+The AUC section includes:
+
+- AUC summary
+- confusion table
+- ROC points table
+- workbook-style ROC sheet layout
+- ROC curve
+
+### Feature Extraction
+
+The feature-extraction section summarizes:
+
+- stepwise feature screening
+- grouped positive and negative variable scoring
+- extracted feature tables
+- grouped-score box plot
+
+### Forest
+
+The forest section shows the retained variable forest plot and forest table.
+
+### Importance
+
+The importance section shows:
+
+- backward elimination by ROC-AUC
+- final top-10 variables
+- importance forest plot
+- importance summary tables
+
+### Comparison
+
+The comparison section shows:
+
+- Top 5 methods by test ROC-AUC
+- full algorithm comparison table
+- algorithm comparison forest plot
+- QSubgrouptest comparison export blocks
+
+Comparison is shown for:
+
+- `Original` variables
+- `Top 10` variables
+
+### Prediction Mode
+
+Prediction mode allows manual value entry using the currently selected variable set and model path. It also shows:
+
+- the displayed fitting algorithm
+- class probabilities
+- PCC curve
+- composite score interpretation text
+
+### Validation
+
+Validation includes:
+
+- full-data AUC
+- training/test split AUC
+- 5-fold cross-validation summary
+- validation confusion table
+- validation prediction table
+
+## Running the App
+
+From R:
 
 ```r
-shiny::runApp("app.R")
+shiny::runApp("F:/jmirdeep")
 ```
 
-Or inside R:
+Or if your working directory is the project folder:
 
 ```r
-source("app.R")
+shiny::runApp()
 ```
 
-## R Package Requirements
+## Package Requirements
 
-Core packages used by the app include:
+Required packages:
 
 - `shiny`
 - `bslib`
 - `DT`
+- `readxl`
 - `openxlsx`
 
-Optional packages improve algorithm coverage:
+Optional algorithm packages:
 
 - `nnet`
 - `MASS`
@@ -97,72 +207,26 @@ Optional packages improve algorithm coverage:
 - `rpart`
 - `randomForest` or `ranger`
 - `e1071`
+- `pROC`
 
-If an optional package is missing, the related algorithm may show as unavailable.
+If an optional package is missing, the related model may be unavailable or may fall back to a simpler path.
 
-## Using The App
+## Current Behavior Notes
 
-### Bundled Demo Buttons
+- The ANN demo CSV path is relative so the app can be deployed more safely.
+- Uploaded sample CSV and demo sample CSV are aligned to the same ANN validation path.
+- Comparison rows are deduplicated so algorithms are not repeated unnecessarily in the comparison table and forest.
+- The app is workbook-oriented and aims to preserve the original project logic while exposing results in Shiny.
 
-- `Load bundled demo button(CNN)`: opens the bundled CNN workbook
-- `Load bundled demo button(ANN)`: opens the bundled ANN workbook
-- `Run selected algorithm on demo CSV`: runs the appended ANN demo CSV and also builds the combined comparison view
+## Known UI Notes
 
-### Uploaded Prediction
+- `README` is currently exposed through the in-app README tab using `includeMarkdown("README.md")`.
+- If the running app still shows older behavior after code changes, fully stop and restart the Shiny session.
 
-There are two uploaded-data run modes:
+## External Forest Export
 
-- `Prediction model (Original data)`: runs directly from workbook `data2`-style input
-- `Prediction model (Normalization data)`: z-score normalizes predictor columns first, then runs the model
+The app provides exportable text blocks for use with:
 
-### AUC Tab
+- [QSubgrouptest.asp](https://www.raschonline.com/kpiall/QSubgrouptest.asp)
 
-The `AUC` tab shows:
-
-- AUC summary
-- confusion table
-- ROC points table
-- ROC curve
-
-### Forest And Importance Tabs
-
-- `Forest`: feature-level forest summary
-- `Importance`: backward elimination by test ROC-AUC until 10 variables remain
-
-### Comparison Tab
-
-Shows independent algorithm comparison, not a pipeline-paired table.
-
-It includes:
-
-- table of testing and training metrics
-- Top 5 methods by test ROC-AUC
-- split forest-style ROC-AUC comparison for `Original` and `Top 10`
-
-### Prediction Mode / PCC
-
-Prediction mode uses the importance-selected variables when available.
-
-The PCC panel shows:
-
-- the current prediction-mode algorithm
-- the category probability curve
-- current score and class probabilities
-
-## Workbook Expectations
-
-For uploaded ANN-style data:
-
-- first column = outcome/status
-- first row = variable names
-- remaining columns = predictors
-
-For uploaded CNN-style data:
-
-- the first status column is transformed into two columns before workbook-style expansion
-
-## Notes
-
-- ANN demo CSV now uses the 15-column sample file, so the model feature count is `14`
-- Forest export text areas are included for QSubgrouptest-style external plotting
-- The app keeps the workbook-oriented behavior as closely as possible while presenting results in Shiny
+These blocks are intended for external forest-plot rendering workflows.
